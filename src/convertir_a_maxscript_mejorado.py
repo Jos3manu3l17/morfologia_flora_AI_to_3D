@@ -39,10 +39,21 @@ def extraer_puntos_mejorado(ruta_archivo):
         
         # Si es una hoja generada o coordenadas 2D
         if "puntos" in data:
-            return {
-                "tipo": "coordenadas_2d",
-                "puntos": [(float(x), float(y)) for x, y in data["puntos"]]
-            }
+            puntos_validos = []
+            for punto in data["puntos"]:
+                try:
+                    x, y = float(punto[0]), float(punto[1])
+                    # Verificar que no sean NaN
+                    if not (math.isnan(x) or math.isnan(y)):
+                        puntos_validos.append((x, y))
+                except (ValueError, TypeError, IndexError):
+                    continue
+            
+            if puntos_validos:
+                return {
+                    "tipo": "coordenadas_2d",
+                    "puntos": puntos_validos
+                }
     
     # Para archivos .py (siluetas del extractor)
     import re
@@ -51,10 +62,20 @@ def extraer_puntos_mejorado(ruta_archivo):
     
     pares = re.findall(r"\(([-\d.]+),\s*([-\d.]+)\)", contenido)
     if pares:
-        return {
-            "tipo": "coordenadas_2d",
-            "puntos": [(float(x), float(y)) for x, y in pares]
-        }
+        puntos_validos = []
+        for x, y in pares:
+            try:
+                fx, fy = float(x), float(y)
+                if not (math.isnan(fx) or math.isnan(fy)):
+                    puntos_validos.append((fx, fy))
+            except ValueError:
+                continue
+        
+        if puntos_validos:
+            return {
+                "tipo": "coordenadas_2d",
+                "puntos": puntos_validos
+            }
     
     return None
 
@@ -223,6 +244,11 @@ def convertir_mejorado(
     if not datos:
         raise ValueError("No se encontraron datos válidos en el archivo.")
     
+    # Validar que haya puntos válidos
+    if datos["tipo"] == "coordenadas_2d":
+        if not datos["puntos"] or len(datos["puntos"]) < 3:
+            raise ValueError(f"No hay suficientes puntos válidos ({len(datos['puntos']) if datos['puntos'] else 0}). Se necesitan al menos 3 puntos.")
+    
     if nombre_objeto is None:
         nombre_objeto = "Hoja_Realista_3D"
     
@@ -247,6 +273,7 @@ def convertir_mejorado(
         "venacion": con_venacion,
         "grosor_variable": grosor_variable,
         "curvatura": curvatura,
+        "puntos_count": len(datos["puntos"]) if datos["tipo"] == "coordenadas_2d" else len(datos["vertices"]) if datos["tipo"] == "malla_3d" else 0,
     }
 
 

@@ -17,6 +17,7 @@ import extractor_siluetas
 import generar
 import entrenar_todo
 import modelo_forma_especie
+import generador_hojas_parametrico
 
 
 RAIZ = Path(__file__).resolve().parent.parent
@@ -160,6 +161,26 @@ class InterfazAutomatica(tk.Tk):
             wraplength=380
         ).pack(anchor="center", pady=(4, 0))
         
+        # Boton de limpiar/reiniciar
+        ttk.Separator(formulario, orient="horizontal").pack(fill="x", pady=15)
+        
+        limpiar_frame = ttk.Frame(formulario, style="Card.TFrame")
+        limpiar_frame.pack(fill="x", pady=8)
+        
+        ttk.Button(
+            limpiar_frame, 
+            text="🧹 LIMPIAR / REINICIAR SESIÓN", 
+            command=self._limpiar_sesion,
+            width=30
+        ).pack(anchor="center", pady=4)
+        
+        ttk.Label(
+            limpiar_frame, 
+            text="Limpia fotos seleccionadas para iniciar con nuevas muestras. Los modelos anteriores se conservan.", 
+            style="Card.TLabel",
+            wraplength=380
+        ).pack(anchor="center", pady=(4, 0))
+        
         # Panel derecho: vista previa y log
         panel_derecho = ttk.Frame(contenido)
         panel_derecho.pack(side="left", fill="both", expand=True)
@@ -236,6 +257,26 @@ class InterfazAutomatica(tk.Tk):
         eje.text(0.5, 0.5, mensaje, ha="center", va="center", color="#7b8a8e", transform=eje.transAxes)
         eje.set_axis_off()
         canvas.draw_idle()
+
+    def _limpiar_sesion(self):
+        """Limpia la sesión actual para iniciar con nuevas muestras sin borrar modelos anteriores."""
+        # Limpiar fotos seleccionadas
+        self.fotos_seleccionadas = []
+        self.variables["fotos"].set("")
+        
+        # Limpiar log
+        self.log_text.delete(1.0, "end")
+        self._log("Sesión reiniciada. Listo para nuevas muestras.")
+        
+        # Limpiar vista previa
+        eje, canvas = self.vistas["generador"]
+        self._limpiar_vista(eje, canvas, "Vista previa de resultados")
+        
+        # Reiniciar estado
+        self.estado.set("Sesión limpiada. Selecciona nuevas fotos.")
+        
+        # Confirmación visual
+        messagebox.showinfo("Sesión Reiniciada", "La sesión ha sido limpiada. Los modelos anteriores se conservan.\n\nSelecciona nuevas fotos para comenzar una nueva generación.")
 
     def _dibujar_puntos(self, puntos, titulo):
         self.eje.clear()
@@ -363,7 +404,11 @@ class InterfazAutomatica(tk.Tk):
                                 # Mostrar primera silueta en vista previa
                                 exteriores = [dato["puntos"] for dato in coordenadas if dato["tipo"] == "EXTERIOR"]
                                 if exteriores:
-                                    self.after(0, lambda p=exteriores[0]: self._dibujar_puntos(p, "Silueta extraida + 3D"))
+                                    puntos_exterior = exteriores[0]
+                                    # Verificar que los puntos sean válidos
+                                    puntos_validos = [(x, y) for x, y in puntos_exterior if not (x != x or y != y)]  # Check for NaN
+                                    if puntos_validos:
+                                        self.after(0, lambda p=puntos_validos: self._dibujar_puntos(p, "Silueta extraida + 3D"))
                             
                             break  # Solo procesar el lote una vez
                         
@@ -404,7 +449,11 @@ class InterfazAutomatica(tk.Tk):
                         if i == 0:
                             exteriores = [dato["puntos"] for dato in coordenadas if dato["tipo"] == "EXTERIOR"]
                             if exteriores:
-                                self.after(0, lambda p=exteriores[0]: self._dibujar_puntos(p, "Silueta extraida"))
+                                puntos_exterior = exteriores[0]
+                                # Verificar que los puntos sean válidos
+                                puntos_validos = [(x, y) for x, y in puntos_exterior if not (x != x or y != y)]  # Check for NaN
+                                if puntos_validos:
+                                    self.after(0, lambda p=puntos_validos: self._dibujar_puntos(p, "Silueta extraida"))
                 
                 except Exception as e:
                     self._log(f"  - Foto {i+1}: Error - {str(e)}")
@@ -414,57 +463,136 @@ class InterfazAutomatica(tk.Tk):
             
             self._log(f"Siluetas extraidas: {len(siluetas_generadas)}/{len(self.fotos_seleccionadas)}")
             
-            # Paso 2: Entrenar modelo (si hay suficientes muestras)
-            self._log("Paso 2/4: Verificando si se puede entrenar modelo...")
-            if len(siluetas_generadas) >= entrenar_todo.MINIMO_MUESTRAS:
-                self._log(f"  Hay {len(siluetas_generadas)} muestras (minimo: {entrenar_todo.MINIMO_MUESTRAS})")
-                self._log("  Entrenando modelo...")
-                
-                try:
-                    modelo_forma_especie.entrenar_especie(
-                        especie, 
-                        siluetas_generadas, 
-                        n_por_lado=100, 
-                        carpeta_modelos=str(RAIZ / "modelos")
-                    )
-                    self._log("  Modelo entrenado correctamente")
-                except Exception as e:
-                    self._log(f"  Error entrenando modelo: {str(e)}")
-                    self._log("  Continuando con modelo existente si esta disponible...")
-            else:
-                self._log(f"  Solo {len(siluetas_generadas)} muestras (necesitas {entrenar_todo.MINIMO_MUESTRAS})")
-                self._log("  No se entrenara nuevo modelo. Usando modelo existente si disponible.")
+            # Paso 2: Entrenar modelo con las imágenes importadas
+            self._log("Paso 2/4: Entrenando modelo con las imágenes importadas...")
+            self._log(f"  Creando modelo para especie: {especie}")
+            self._log(f"  Muestras disponibles: {len(siluetas_generadas)}")
             
-            # Paso 3: Generar hojas
-            self._log("Paso 3/4: Generando hojas sinteticas...")
+            if len(siluetas_generadas) < entrenar_todo.MINIMO_MUESTRAS:
+                self._log(f"  ⚠ ADVERTENCIA: Solo {len(siluetas_generadas)} muestras (recomendado: {entrenar_todo.MINIMO_MUESTRAS}+)")
+                self._log("  El modelo sera menos preciso pero se generara igualmente...")
+            
+            try:
+                # Entrenar siempre con las imágenes importadas
+                modelo_forma_especie.entrenar_especie(
+                    especie, 
+                    siluetas_generadas, 
+                    n_por_lado=100, 
+                    carpeta_modelos=str(RAIZ / "modelos")
+                )
+                self._log("  ✅ Modelo entrenado correctamente con las imágenes importadas")
+            except Exception as e:
+                self._log(f"  ❌ Error entrenando modelo: {str(e)}")
+                raise ValueError(f"No se pudo entrenar el modelo con las imágenes importadas: {str(e)}")
+            
+            # Paso 3: Generar hojas con el modelo recién creado
+            self._log("Paso 3/4: Generando hojas sinteticas con el modelo importado...")
             carpeta_modelos = str(RAIZ / "modelos")
-            carpeta_generadas = RAIZ / "hojas_generadas"
+            
+            # Crear carpeta específica para esta sesión de generación
+            carpeta_generadas = carpeta_especie / "generadas"
             carpeta_generadas.mkdir(parents=True, exist_ok=True)
             
-            especies_disponibles = generar.listar_especies_disponibles(carpeta_modelos)
-            if especie not in especies_disponibles:
-                raise ValueError(f"No hay modelo disponible para la especie '{especie}'. Necesitas al menos {entrenar_todo.MINIMO_MUESTRAS} muestras para entrenar.")
+            self._log(f"  Generando {cantidad_hojas} hoja(s) basadas en las imágenes importadas...")
             
             hojas_generadas = []
             for i in range(cantidad_hojas):
                 try:
+                    # Intentar generar con modelo estadístico
                     hoja = modelo_forma_especie.generar_hoja_de_especie(
                         especie, 
                         carpeta_modelos=carpeta_modelos, 
                         intensidad=intensidad, 
                         semilla=None
                     )
-                    ruta = carpeta_generadas / f"{especie}_generada_{i + 1:03d}.json"
+                    
+                    # Validar que la hoja generada tenga puntos válidos
+                    puntos_validos = [(x, y) for x, y in hoja["puntos"] if not (x != x or y != y)]
+                    
+                    if len(puntos_validos) < 10:
+                        self._log(f"  - Hoja {i+1}: Modelo generó pocos puntos ({len(puntos_validos)}), usando siluetas extraídas...")
+                        # Fallback: usar directamente las siluetas extraídas de las imágenes
+                        if siluetas_generadas:
+                            # Usar la primera silueta extraída como base
+                            silueta_base = siluetas_generadas[0]
+                            # Leer los puntos de la silueta extraída
+                            with open(silueta_base, 'r') as f:
+                                contenido = f.read()
+                            import re
+                            pares = re.findall(r"\(([-\d.]+),\s*([-\d.]+)\)", contenido)
+                            if pares:
+                                puntos_silueta = [(float(x), float(y)) for x, y in pares]
+                                # Crear variación simple aplicando escala aleatoria
+                                import random
+                                escala_variacion = 0.9 + random.random() * 0.2  # 0.9-1.1
+                                puntos_variados = [(x * escala_variacion, y * escala_variacion) for x, y in puntos_silueta]
+                                
+                                hoja = {
+                                    "id": f"{especie}_extraida_{i}",
+                                    "fuente": "silueta_extraida",
+                                    "puntos": puntos_variados,
+                                    "num_puntos": len(puntos_variados)
+                                }
+                                self._log(f"  - Hoja {i+1}: Generada desde silueta extraída (variación {escala_variacion:.2f}x)")
+                            else:
+                                raise ValueError("No se encontraron puntos en la silueta extraída")
+                        else:
+                            raise ValueError("No hay siluetas extraídas disponibles")
+                    
+                    # Guardar con nombre específico que incluya la especie
+                    ruta = carpeta_generadas / f"{especie}_importada_{i + 1:03d}.json"
                     ruta.write_text(json.dumps(hoja, ensure_ascii=False, indent=2), encoding="utf-8")
                     hojas_generadas.append(ruta)
-                    self._log(f"  - Hoja {i+1} generada")
+                    self._log(f"  - Hoja {i+1} generada: {ruta.name}")
                     
                     # Mostrar ultima hoja generada en vista previa
                     if i == cantidad_hojas - 1:
-                        self.after(0, lambda p=hoja["puntos"]: self._dibujar_puntos(p, f"{especie} generada"))
+                        puntos_hoja = hoja["puntos"]
+                        # Verificar que los puntos sean válidos
+                        puntos_validos = [(x, y) for x, y in puntos_hoja if not (x != x or y != y)]  # Check for NaN
+                        if puntos_validos:
+                            self.after(0, lambda p=puntos_validos, s=especie: self._dibujar_puntos(p, f"{s} importada"))
                 
                 except Exception as e:
-                    self._log(f"  - Hoja {i+1}: Error - {str(e)}")
+                    self._log(f"  - Hoja {i+1}: Error en modelo estadístico - {str(e)}, usando siluetas extraídas...")
+                    try:
+                        # Fallback: usar directamente las siluetas extraídas
+                        if siluetas_generadas:
+                            silueta_base = siluetas_generadas[0]
+                            with open(silueta_base, 'r') as f:
+                                contenido = f.read()
+                            import re
+                            pares = re.findall(r"\(([-\d.]+),\s*([-\d.]+)\)", contenido)
+                            if pares:
+                                puntos_silueta = [(float(x), float(y)) for x, y in pares]
+                                import random
+                                escala_variacion = 0.85 + random.random() * 0.3  # 0.85-1.15
+                                puntos_variados = [(x * escala_variacion, y * escala_variacion) for x, y in puntos_silueta]
+                                
+                                hoja = {
+                                    "id": f"{especie}_extraida_{i}",
+                                    "fuente": "silueta_extraida_fallback",
+                                    "puntos": puntos_variados,
+                                    "num_puntos": len(puntos_variados)
+                                }
+                                
+                                ruta = carpeta_generadas / f"{especie}_extraida_{i + 1:03d}.json"
+                                ruta.write_text(json.dumps(hoja, ensure_ascii=False, indent=2), encoding="utf-8")
+                                hojas_generadas.append(ruta)
+                                self._log(f"  - Hoja {i+1} generada (silueta): {ruta.name}")
+                                
+                                # Mostrar ultima hoja generada en vista previa
+                                if i == cantidad_hojas - 1:
+                                    puntos_validos = [(x, y) for x, y in puntos_variados if not (x != x or y != y)]
+                                    if puntos_validos:
+                                        self.after(0, lambda p=puntos_validos, s=especie: self._dibujar_puntos(p, f"{s} extraída"))
+                            else:
+                                raise ValueError("No se encontraron puntos en la silueta extraída")
+                        else:
+                            raise ValueError("No hay siluetas extraídas disponibles")
+                    
+                    except Exception as e2:
+                        self._log(f"  - Hoja {i+1}: Error también en siluetas extraídas - {str(e2)}")
             
             if not hojas_generadas:
                 raise ValueError("No se pudo generar ninguna hoja. Verifica que el modelo existe.")
@@ -473,32 +601,45 @@ class InterfazAutomatica(tk.Tk):
             
             # Paso 4: Convertir a MAXScript con realismo mejorado
             self._log("Paso 4/4: Convirtiendo a MAXScript con realismo mejorado...")
-            carpeta_maxscript = RAIZ / "maxscript_generado"
+            
+            # Crear carpeta específica para MAXScripts de esta especie
+            carpeta_maxscript = carpeta_especie / "maxscript"
             carpeta_maxscript.mkdir(parents=True, exist_ok=True)
+            
+            self._log(f"  Guardando MAXScripts en: {carpeta_maxscript}")
             
             maxscripts_generados = []
             for i, hoja_json in enumerate(hojas_generadas):
                 try:
-                    # Verificar si hay malla 3D disponible
-                    archivo_3d = carpeta_especie / f"{Path(hoja_json).stem.replace('_generada', '')}_3d.json"
+                    # Verificar si hay malla 3D disponible de las imágenes importadas
+                    archivo_3d = carpeta_especie / f"{Path(hoja_json).stem.replace('_importada', '')}_3d.json"
                     entrada_malla = str(archivo_3d) if archivo_3d.exists() else str(hoja_json)
                     
                     resultado = convertir_a_maxscript_mejorado.convertir_mejorado(
                         entrada_malla,
-                        str(carpeta_maxscript / f"{especie}_realista_{i + 1:03d}.ms"),
+                        str(carpeta_maxscript / f"{especie}_importada_{i + 1:03d}.ms"),
                         altura_extrusion=extrusion,
                         escala=1.0,
-                        nombre_objeto=f"{especie}_realista_{i + 1}",
+                        nombre_objeto=f"{especie}_importada_{i + 1}",
                         con_venacion=self.con_venacion.get(),
                         grosor_variable=self.grosor_variable.get(),
                         curvatura=curvatura,
                         detalle_superficie=self.detalle_superficie.get()
                     )
                     maxscripts_generados.append(resultado["archivo_salida"])
-                    self._log(f"  - MAXScript {i+1} creado (venación: {resultado['venacion']}, grosor variable: {resultado['grosor_variable']})")
+                    self._log(f"  - MAXScript {i+1} creado: {Path(resultado['archivo_salida']).name}")
+                    self._log(f"    (venación: {resultado['venacion']}, grosor variable: {resultado['grosor_variable']})")
                 
                 except Exception as e:
                     self._log(f"  - MAXScript {i+1}: Error - {str(e)}")
+                    # Diagnóstico: verificar el contenido del JSON
+                    try:
+                        with open(hoja_json, 'r') as f:
+                            contenido = f.read()
+                            self._log(f"  - Diagnóstico: primeros 200 caracteres del JSON: {contenido[:200]}")
+                    except:
+                        pass
+                    
                     # Fallback al conversor simple
                     try:
                         resultado = convertir_a_maxscript.convertir(
@@ -523,12 +664,17 @@ class InterfazAutomatica(tk.Tk):
             self._log("=" * 50)
             self._log("PIPELINE COMPLETADO EXITOSAMENTE")
             self._log("=" * 50)
-            self._log(f"Siluetas extraidas: {len(siluetas_generadas)}")
-            self._log(f"Hojas generadas: {len(hojas_generadas)}")
-            self._log(f"MAXScripts creados: {len(maxscripts_generados)}")
-            self._log(f"Archivos en: {carpeta_maxscript}")
+            self._log(f"📁 Estructura creada para especie: {especie}")
+            self._log(f"   📂 Carpeta principal: {carpeta_especie}")
+            self._log(f"   📂 Siluetas: {len(siluetas_generadas)} archivos *_silueta.py")
+            self._log(f"   📂 Generadas: {len(hojas_generadas)} hojas sintéticas")
+            self._log(f"   📂 MAXScript: {len(maxscripts_generados)} archivos .ms")
+            self._log(f"   📂 Modelo: {especie}.json en modelos/")
+            self._log("")
+            self._log(f"🎯 Todas las hojas generadas están basadas EXCLUSIVAMENTE en las imágenes importadas")
+            self._log(f"🎯 No se usaron modelos preexistentes de otras especies")
             
-            return f"Pipeline completado. Generados {len(maxscripts_generados)} archivos MAXScript en {carpeta_maxscript}"
+            return f"Pipeline completado para {especie}. Estructura completa creada en {carpeta_especie}"
 
         self._ejecutar("Ejecutando pipeline completo", pipeline_completo)
 
