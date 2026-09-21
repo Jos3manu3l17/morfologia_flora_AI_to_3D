@@ -1,4 +1,6 @@
 import cv2
+import json
+import numpy as np
 import tkinter as tk
 from tkinter import filedialog
 import os
@@ -73,19 +75,27 @@ MARGEN = 40
 
 AREA_MINIMA = 100
 
+# ----------------------------------------------------------
+# Parametros de reconstruccion 3D relativa
+# ----------------------------------------------------------
+
+RESOLUCION_MALLA = 120
+ALTURA_RELIEVE = 20.0
+PROFUNDIDAD_MINIMA = 0.05
+
 
 # ==========================================================
 # SELECCIONAR IMAGEN
 # ==========================================================
 
-def seleccionar_imagen():
+def seleccionar_imagenes():
 
     root = tk.Tk()
 
     root.withdraw()
 
-    ruta = filedialog.askopenfilename(
-        title="Selecciona la imagen de la hoja",
+    rutas = filedialog.askopenfilenames(
+        title="Selecciona una o varias fotos de la hoja",
         filetypes=[
             (
                 "Imagenes",
@@ -100,7 +110,13 @@ def seleccionar_imagen():
 
     root.destroy()
 
-    return ruta
+    return list(rutas)
+
+
+def seleccionar_imagen():
+    """Compatibilidad con el nombre original: devuelve una sola ruta."""
+    rutas = seleccionar_imagenes()
+    return rutas[0] if rutas else ""
 
 
 # ==========================================================
@@ -121,6 +137,175 @@ def cargar_imagen(ruta):
         )
 
     return imagen
+
+
+def cargar_imagenes(rutas):
+    """Carga y valida todas las vistas en escala de grises."""
+    imagenes = [cargar_imagen(ruta) for ruta in rutas]
+    if not imagenes:
+        raise ValueError("No se seleccionaron imagenes.")
+
+    forma = imagenes[0].shape
+    return [
+        imagen if imagen.shape == forma else cv2.resize(
+            imagen, (forma[1], forma[0]), interpolation=cv2.INTER_AREA
+        )
+        for imagen in imagenes
+    ]
+
+
+def alinear_vistas(imagenes):
+    """Alinea vistas con transformaciones afines para comparar iluminacion."""
+    referencia = imagenes[0]
+    alineadas = [referencia]
+    referencia_float = referencia.astype(np.float32) / 255.0
+
+    for imagen in imagenes[1:]:
+        imagen_float = imagen.astype(np.float32) / 255.0
+        matriz = np.eye(2, 3, dtype=np.float32)
+        try:
+            cv2.findTransformECC(
+                referencia_float,
+                imagen_float,
+                matriz,
+                cv2.MOTION_AFFINE,
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-5),
+            )
+            alineada = cv2.warpAffine(
+                imagen,
+                matriz,
+                (referencia.shape[1], referencia.shape[0]),
+                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REFLECT,
+            )
+        except cv2.error:
+            # Una vista sin textura suficiente no debe detener el proceso.
+            alineada = imagen
+        alineadas.append(alineada)
+
+    return alineadas
+
+
+def estimar_profundidad_sombreado(imagenes, mascara):
+    """Estima relieve relativo a partir de cambios de iluminacion."""
+    pila = np.stack([imagen.astype(np.float32) / 255.0 for imagen in imagenes])
+    brillo = np.median(pila, axis=0)
+    brillo = cv2.GaussianBlur(brillo, (0, 0), 2.0)
+
+    dentro = mascara > 0
+    if not np.any(dentro):
+        return np.zeros_like(brillo, dtype=np.float32)
+
+    valores = brillo[dentro]
+    minimo, maximo = float(valores.min()), float(valores.max())
+    if maximo - minimo < 1e-6:
+        return np.zeros_like(brillo, dtype=np.float32)
+
+    # En una hoja opaca, las zonas relativamente oscuras se interpretan
+    # como relieve alto. El resultado es relativo porque no hay luces calibradas.
+    profundidad = 1.0 - (brillo - minimo) / (maximo - minimo)
+    profundidad = cv2.GaussianBlur(profundidad, (0, 0), 1.2)
+    profundidad[~dentro] = 0.0
+    return np.clip(profundidad, 0.0, 1.0).astype(np.float32)
+
+
+def estimar_profundidad_fotogrametrica(imagenes, mascara):
+    """Obtiene disparidad relativa entre las dos primeras vistas, si es posible."""
+    if len(imagenes) < 2:
+        return None
+
+    ancho = imagenes[0].shape[1]
+    num_disparidades = max(16, (ancho // 8) // 16 * 16)
+    num_disparidades = min(num_disparidades, 128)
+
+    try:
+        stereo = cv2.StereoSGBM_create(
+            minDisparity=0,
+            numDisparities=num_disparidades,
+            blockSize=5,
+            P1=8 * 5 * 5,
+            P2=32 * 5 * 5,
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+        )
+        disparidad = stereo.compute(imagenes[0], imagenes[1]).astype(np.float32)
+        disparidad /= 16.0
+        valido = (disparidad > 1.0) & (mascara > 0)
+        if np.count_nonzero(valido) < 100:
+            return None
+
+        profundidad = np.zeros_like(disparidad, dtype=np.float32)
+        profundidad[valido] = 1.0 / disparidad[valido]
+        valores = profundidad[valido]
+        minimo, maximo = float(np.percentile(valores, 5)), float(np.percentile(valores, 95))
+        if maximo - minimo < 1e-6:
+            return None
+        profundidad = np.clip((profundidad - minimo) / (maximo - minimo), 0.0, 1.0)
+        profundidad[~(mascara > 0)] = 0.0
+        return cv2.GaussianBlur(profundidad, (0, 0), 1.0)
+    except cv2.error:
+        return None
+
+
+def construir_malla_3d(profundidad, mascara, ancho_mundo=100.0):
+    """Convierte el mapa de profundidad relativo en vertices y caras."""
+    alto, ancho = profundidad.shape
+    paso = max(1, int(max(alto, ancho) / RESOLUCION_MALLA))
+    ys = range(0, alto, paso)
+    xs = range(0, ancho, paso)
+    vertices = []
+    indices = {}
+
+    for y in ys:
+        for x in xs:
+            if mascara[y, x] == 0:
+                continue
+            indice = len(vertices)
+            indices[(y, x)] = indice
+            px = (x - ancho / 2) * ancho_mundo / max(ancho, 1)
+            py = (alto / 2 - y) * ancho_mundo / max(ancho, 1)
+            pz = float(profundidad[y, x]) * ALTURA_RELIEVE
+            vertices.append([round(px, 4), round(py, 4), round(pz, 4)])
+
+    caras = []
+    for y in ys:
+        for x in xs:
+            puntos = [
+                indices.get((y, x)),
+                indices.get((y, x + paso)),
+                indices.get((y + paso, x + paso)),
+                indices.get((y + paso, x)),
+            ]
+            if all(indice is not None for indice in puntos):
+                caras.append([indice + 1 for indice in puntos])
+
+    return vertices, caras
+
+
+def guardar_reconstruccion_3d(ruta_imagen, vertices, caras, profundidad_origen):
+    """Guarda una malla OBJ y sus metadatos JSON junto a la primera foto."""
+    carpeta = os.path.dirname(ruta_imagen)
+    nombre = os.path.splitext(os.path.basename(ruta_imagen))[0]
+    ruta_obj = os.path.join(carpeta, nombre + "_3d.obj")
+    ruta_json = os.path.join(carpeta, nombre + "_3d.json")
+
+    with open(ruta_obj, "w", encoding="utf-8") as archivo:
+        archivo.write("# Malla 3D relativa generada desde multiples vistas\n")
+        for x, y, z in vertices:
+            archivo.write("v {:.4f} {:.4f} {:.4f}\n".format(x, y, z))
+        for cara in caras:
+            archivo.write("f {}\n".format(" ".join(map(str, cara))))
+
+    datos = {
+        "tipo": "reconstruccion_3d_relativa",
+        "vertices": vertices,
+        "caras": caras,
+        "altura_relieve": ALTURA_RELIEVE,
+        "profundidad_minima": PROFUNDIDAD_MINIMA,
+    }
+    with open(ruta_json, "w", encoding="utf-8") as archivo:
+        json.dump(datos, archivo, ensure_ascii=False, indent=2)
+
+    return ruta_obj, ruta_json
 
 
 # ==========================================================
@@ -874,12 +1059,12 @@ def main():
     print()
 
     print(
-        "Selecciona una imagen..."
+        "Selecciona una o varias fotos de la misma hoja..."
     )
 
-    ruta = seleccionar_imagen()
+    rutas = seleccionar_imagenes()
 
-    if not ruta:
+    if not rutas:
 
         print()
         print(
@@ -890,13 +1075,11 @@ def main():
 
     print()
 
-    print(
-        "Imagen:"
-    )
+    ruta = rutas[0]
 
-    print(
-        ruta
-    )
+    print("Fotos seleccionadas:", len(rutas))
+    for ruta_actual in rutas:
+        print(" -", ruta_actual)
 
     print()
 
@@ -908,9 +1091,9 @@ def main():
     # CARGAR
     # ------------------------------------------------------
 
-    imagen = cargar_imagen(
-        ruta
-    )
+    imagenes = cargar_imagenes(rutas)
+    imagenes = alinear_vistas(imagenes)
+    imagen = imagenes[0]
 
     alto, ancho = imagen.shape
 
@@ -934,6 +1117,26 @@ def main():
     mascara = limpiar_mascara(
         mascara
     )
+
+    profundidad_sombreado = estimar_profundidad_sombreado(
+        imagenes,
+        mascara
+    )
+
+    profundidad_fotogrametrica = estimar_profundidad_fotogrametrica(
+        imagenes,
+        mascara
+    )
+
+    if profundidad_fotogrametrica is not None:
+        profundidad = (
+            0.65 * profundidad_fotogrametrica
+            + 0.35 * profundidad_sombreado
+        )
+        metodo_3d = "fotogrametria relativa + sombreado"
+    else:
+        profundidad = profundidad_sombreado
+        metodo_3d = "shape from shading relativo"
 
     # ------------------------------------------------------
     # CONTORNOS
@@ -1117,6 +1320,18 @@ def main():
         codigo
     )
 
+    vertices, caras = construir_malla_3d(
+        profundidad,
+        mascara
+    )
+
+    archivo_obj, archivo_json_3d = guardar_reconstruccion_3d(
+        ruta,
+        vertices,
+        caras,
+        profundidad
+    )
+
     # ------------------------------------------------------
     # FINAL
     # ------------------------------------------------------
@@ -1153,6 +1368,36 @@ def main():
 
     print(
         archivo_coordenadas
+    )
+
+    print()
+
+    print(
+        "Metodo 3D:"
+    )
+
+    print(
+        metodo_3d
+    )
+
+    print()
+
+    print(
+        "Malla OBJ:"
+    )
+
+    print(
+        archivo_obj
+    )
+
+    print()
+
+    print(
+        "Datos 3D JSON:"
+    )
+
+    print(
+        archivo_json_3d
     )
 
     print()

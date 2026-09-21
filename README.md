@@ -80,3 +80,17 @@ dataset_hojas/
 2.python src/entrenar_todo.py
 
 3.python src/convertir_a_maxscript.py fotos_procesadas/euphorbia_lactea/Euphorbia01_silueta.py euphorbia_3d.ms --tolerancia 1.0 --extrusion 20 --nombre "Euphorbia_3D"
+
+## Captura multi-angular y relieve 3D
+
+`src/extractor_siluetas.py` permite seleccionar una o varias fotos de la
+misma hoja. La primera foto conserva la salida 2D original (`*_silueta.py` y
+`*_coordenadas.txt`). Cuando se seleccionan varias vistas, también se generan:
+
+- `*_3d.obj`: malla relativa para Blender, MeshLab u otros programas 3D.
+- `*_3d.json`: vertices, caras y parametros de la reconstruccion.
+
+El extractor alinea las vistas, intenta obtener disparidad con las dos
+primeras imagenes y usa `shape from shading` como respaldo o complemento.
+La profundidad es relativa: para obtener medidas metricas se necesitan
+calibracion de camara, escala fisica y posiciones conocidas de las tomas.
