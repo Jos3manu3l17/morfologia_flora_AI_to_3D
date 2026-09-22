@@ -35,7 +35,9 @@ dataset_hojas/
    python -m venv .venv
    ```
 3. Actívalo:
-   - Windows: `.venv\Scripts\activate`
+   - Windows: `
+   
+   `
    - Mac/Linux: `source .venv/bin/activate`
 4. Instala dependencias:
    ```
