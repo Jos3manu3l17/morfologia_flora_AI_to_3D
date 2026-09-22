@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import threading
+from shutil import copy2
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -18,6 +19,7 @@ import generar
 import entrenar_todo
 import modelo_forma_especie
 import generador_hojas_parametrico
+import estimar_relieve
 
 
 RAIZ = Path(__file__).resolve().parent.parent
@@ -140,6 +142,20 @@ class InterfazAutomatica(tk.Tk):
         
         self._campo(formulario, "Curvatura natural (°)", "curvatura", "5.0", ancho=12)
         
+        # Opciones de Relieve 3D (NUEVAS)
+        ttk.Separator(formulario, orient="horizontal").pack(fill="x", pady=15)
+        ttk.Label(formulario, text="Relieve 3D (Shape-from-Shading)", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 10))
+        
+        self.estimar_relieve_var = tk.BooleanVar(value=True)
+        fila_relieve = ttk.Frame(formulario, style="Card.TFrame")
+        fila_relieve.pack(fill="x", pady=5)
+        ttk.Checkbutton(fila_relieve, text="Estimar relieve 3D desde imagen cenital", variable=self.estimar_relieve_var, style="Card.TLabel").pack(side="left")
+        
+        self._campo(formulario, "Método de relieve", "metodo_relieve", "hibrido_siluetas", ancho=18)
+        self._campo(formulario, "Altura máxima relieve", "altura_relieve", "20.0", ancho=12)
+        self._campo(formulario, "Peso base silueta", "peso_base", "0.75", ancho=12)
+        self._campo(formulario, "Sigma filtro SFS", "sigma_filtro", "3.0", ancho=12)
+        
         # Boton principal
         ttk.Separator(formulario, orient="horizontal").pack(fill="x", pady=15)
         
@@ -156,7 +172,7 @@ class InterfazAutomatica(tk.Tk):
         
         ttk.Label(
             boton_frame, 
-            text="Procesará: Extracción → Entrenamiento → Generación → MAXScript 3D", 
+            text="Procesará: Extracción 2D → Relieve 3D (opcional) → Entrenamiento → Generación → MAXScript 3D", 
             style="Card.TLabel",
             wraplength=380
         ).pack(anchor="center", pady=(4, 0))
@@ -269,8 +285,7 @@ class InterfazAutomatica(tk.Tk):
         self._log("Sesión reiniciada. Listo para nuevas muestras.")
         
         # Limpiar vista previa
-        eje, canvas = self.vistas["generador"]
-        self._limpiar_vista(eje, canvas, "Vista previa de resultados")
+        self._limpiar_vista(self.eje, self.canvas, "Vista previa de resultados")
         
         # Reiniciar estado
         self.estado.set("Sesión limpiada. Selecciona nuevas fotos.")
@@ -335,6 +350,13 @@ class InterfazAutomatica(tk.Tk):
             tolerancia = float(self.variables["tolerancia"].get())
             curvatura = float(self.variables["curvatura"].get())
             
+            # Nuevos parámetros de relieve
+            usar_relieve = self.estimar_relieve_var.get()
+            metodo_relieve = self.variables["metodo_relieve"].get()
+            altura_relieve = float(self.variables["altura_relieve"].get())
+            peso_base = float(self.variables["peso_base"].get())
+            sigma_filtro = float(self.variables["sigma_filtro"].get())
+            
             if cantidad_hojas < 1 or intensidad < 0 or extrusion < 0 or tolerancia < 0:
                 raise ValueError
         except ValueError:
@@ -345,20 +367,33 @@ class InterfazAutomatica(tk.Tk):
             self._log("Iniciando pipeline completo...")
             self._log(f"Especie: {especie}")
             self._log(f"Fotos: {len(self.fotos_seleccionadas)}")
+            self._log(f"Estimar relieve 3D: {usar_relieve}")
+            if usar_relieve:
+                self._log(f"Método relieve: {metodo_relieve}")
             
             # Paso 1: Extraer siluetas (con soporte 3D si hay múltiples vistas)
-            self._log("Paso 1/4: Extrayendo siluetas...")
+            self._log("Paso 1/5: Extrayendo siluetas...")
             carpeta_especie = Path(carpeta_trabajo) / especie
             carpeta_especie.mkdir(parents=True, exist_ok=True)
+            carpeta_originales = carpeta_especie / "fotos_originales"
+            carpeta_originales.mkdir(parents=True, exist_ok=True)
             
             siluetas_generadas = []
-            tiene_3d = len(self.fotos_seleccionadas) > 1
+            relieves_generados = []
+
+            # Cada foto seleccionada es una muestra independiente, no una vista de la misma hoja.
+            tiene_3d = False
             
             if tiene_3d:
                 self._log(f"  Detectadas {len(self.fotos_seleccionadas)} vistas - intentando reconstrucción 3D...")
             
             for i, foto in enumerate(self.fotos_seleccionadas):
                 try:
+                    # Conservar la foto original junto a sus resultados reproducibles.
+                    ruta_origen = Path(foto)
+                    ruta_foto_guardada = carpeta_originales / f"{i + 1:03d}_{ruta_origen.name}"
+                    if ruta_origen.resolve() != ruta_foto_guardada.resolve():
+                        copy2(ruta_origen, ruta_foto_guardada)
                     # Si hay múltiples vistas, procesar todas juntas para 3D
                     if tiene_3d and i == 0:
                         try:
@@ -444,6 +479,16 @@ class InterfazAutomatica(tk.Tk):
                         
                         siluetas_generadas.append(archivo_py)
                         self._log(f"  - Foto {i+1}: Silueta extraida correctamente")
+
+                        if usar_relieve:
+                            ruta_relieve = carpeta_especie / f"{nombre}_relieve.json"
+                            estimar_relieve.procesar_imagen_con_relieve(
+                                str(ruta_foto_guardada), str(archivo_py), str(ruta_relieve),
+                                metodo=metodo_relieve, altura_max=altura_relieve,
+                                peso_base=peso_base, sigma_filtro=sigma_filtro,
+                            )
+                            relieves_generados.append((nombre, ruta_relieve))
+                            self._log(f"    Relieve h�brido guardado: {ruta_relieve.name}")
                         
                         # Mostrar primera silueta en vista previa
                         if i == 0:
@@ -462,6 +507,23 @@ class InterfazAutomatica(tk.Tk):
                 raise ValueError("No se pudo extraer ninguna silueta valida. Revisa las fotos (fondo claro, hoja oscura).")
             
             self._log(f"Siluetas extraidas: {len(siluetas_generadas)}/{len(self.fotos_seleccionadas)}")
+
+            # Exportar una malla MAXScript por cada muestra real que tenga relieve.
+            carpeta_maxscript = carpeta_especie / "maxscript"
+            carpeta_maxscript.mkdir(parents=True, exist_ok=True)
+            maxscripts_relieve = []
+            for nombre_muestra, ruta_relieve in relieves_generados:
+                salida_relieve = carpeta_maxscript / f"{nombre_muestra}_relieve.ms"
+                resultado_relieve = convertir_a_maxscript_mejorado.convertir_mejorado(
+                    str(ruta_relieve), str(salida_relieve),
+                    nombre_objeto=f"{especie}_{nombre_muestra}_relieve",
+                    con_venacion=self.con_venacion.get(),
+                    grosor_variable=self.grosor_variable.get(),
+                    curvatura=curvatura,
+                    detalle_superficie=self.detalle_superficie.get(),
+                )
+                maxscripts_relieve.append(resultado_relieve["archivo_salida"])
+                self._log(f"  - MAXScript con relieve creado: {salida_relieve.name}")
             
             # Paso 2: Entrenar modelo con las imágenes importadas
             self._log("Paso 2/4: Entrenando modelo con las imágenes importadas...")
@@ -603,9 +665,6 @@ class InterfazAutomatica(tk.Tk):
             self._log("Paso 4/4: Convirtiendo a MAXScript con realismo mejorado...")
             
             # Crear carpeta específica para MAXScripts de esta especie
-            carpeta_maxscript = carpeta_especie / "maxscript"
-            carpeta_maxscript.mkdir(parents=True, exist_ok=True)
-            
             self._log(f"  Guardando MAXScripts en: {carpeta_maxscript}")
             
             maxscripts_generados = []

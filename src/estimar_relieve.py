@@ -27,19 +27,22 @@ from scipy import interpolate
 
 ALTURA_RELIEVE_DEFAULT = 20.0  # Escala máxima para el relieve (unidades arbitrarias)
 METODO_DEFAULT = "gradiente_intensidad_normalizado"
+PESO_BASE_DEFAULT = 0.75  # Peso para distance transform (silueta como restricción)
+SIGMA_FILTRO_DEFAULT = 3.0  # Sigma para Gaussian blur del SFS
 
 
 # ==============================================================
 # SHAPE-FROM-SHADING SIMPLE
 # ==============================================================
 
-def estimar_relieve_sfs(imagen, mascara, metodo="gradiente_intensidad_normalizado"):
+def estimar_relieve_sfs(imagen, mascara, metodo="gradiente_intensidad_normalizado", peso_base=PESO_BASE_DEFAULT, sigma_filtro=SIGMA_FILTRO_DEFAULT):
     """
     Estima mapa de altura usando shape-from-shading simple de una sola vista.
     
     Métodos implementados:
     - "gradiente_intensidad_normalizado": Usa gradiente de intensidad normalizado por silueta
     - "intensidad_invertida": Inversión simple de intensidad (zonas oscuras = relieve alto)
+    - "hibrido_siluetas": Combina distance transform de silueta con SFS filtrado
     
     Args:
         imagen: Array numpy (H, W) en escala de grises
@@ -53,6 +56,8 @@ def estimar_relieve_sfs(imagen, mascara, metodo="gradiente_intensidad_normalizad
         return _sfs_gradiente_normalizado(imagen, mascara)
     elif metodo == "intensidad_invertida":
         return _sfs_intensidad_invertida(imagen, mascara)
+    elif metodo == "hibrido_siluetas":
+        return _sfs_hibrido_siluetas(imagen, mascara, peso_base=peso_base, sigma_filtro=sigma_filtro)
     else:
         raise ValueError(f"Método desconocido: {metodo}")
 
@@ -114,6 +119,81 @@ def _sfs_intensidad_invertida(imagen, mascara):
     
     # Invertir intensidad
     mapa_altura = (1.0 - imagen_float) * mascara_bin
+    
+    return mapa_altura
+
+
+def _sfs_hibrido_siluetas(imagen, mascara, peso_base=PESO_BASE_DEFAULT, 
+                          sigma_filtro=SIGMA_FILTRO_DEFAULT):
+    """
+    Método híbrido: distance transform de silueta + SFS filtrado.
+    
+    Componentes:
+    1. Forma base desde silueta: distance transform (centro alto, bordes bajos)
+    2. Componente SFS filtrada: Gaussian blur para eliminar ruido de alta frecuencia
+    3. Mezcla ponderada: peso_base alto (0.7-0.8) para que silueta domine
+    
+    Args:
+        imagen: Array numpy (H, W) en escala de grises
+        mascara: Array numpy (H, W) binaria (255 dentro de la hoja, 0 fuera)
+        peso_base: Peso para distance transform (default 0.75)
+        sigma_filtro: Sigma para Gaussian blur del SFS (default 3.0)
+    
+    Returns:
+        mapa_altura: Array numpy (H, W) normalizado 0-1 dentro de la silueta
+    """
+    imagen_float = imagen.astype(np.float32) / 255.0
+    mascara_bin = (mascara > 0).astype(np.float32)
+    
+    # COMPONENTE 1: Distance transform de la silueta
+    # Esto da "centro alto, bordes bajos" sin depender del SFS
+    from scipy.ndimage import distance_transform_edt
+    
+    # Distance transform desde el borde hacia adentro
+    # Los píxeles lejos del borde (centro) tendrán valores altos
+    distancia = distance_transform_edt(mascara_bin.astype(np.uint8))
+    
+    # Normalizar distance transform al rango [0, 1]
+    dentro = mascara_bin > 0
+    if np.any(dentro):
+        dist_dentro = distancia[dentro]
+        min_dist, max_dist = dist_dentro.min(), dist_dentro.max()
+        if max_dist - min_dist > 1e-6:
+            distancia_normalizada = (distancia - min_dist) / (max_dist - min_dist)
+        else:
+            distancia_normalizada = np.zeros_like(distancia)
+    else:
+        distancia_normalizada = np.zeros_like(distancia)
+    
+    # Aplicar máscara
+    forma_base = distancia_normalizada * mascara_bin
+    
+    # COMPONENTE 2: SFS filtrado (sin ruido de alta frecuencia)
+    # Primero obtener SFS normal
+    sfs_normal = _sfs_gradiente_normalizado(imagen, mascara)
+    
+    # Aplicar filtro pasa-bajos agresivo para eliminar ruido granular
+    sfs_filtrado = cv2.GaussianBlur(sfs_normal, (0, 0), sigma_filtro)
+    
+    # COMPONENTE 3: Mezcla ponderada
+    # peso_base alto para que la silueta domine, SFS solo aporte matices
+    mapa_hibrido = peso_base * forma_base + (1 - peso_base) * sfs_filtrado
+    
+    # Normalizar resultado final al rango [0, 1]
+    dentro = mascara_bin > 0
+    if np.any(dentro):
+        valores_dentro = mapa_hibrido[dentro]
+        min_val, max_val = valores_dentro.min(), valores_dentro.max()
+        if max_val - min_val > 1e-6:
+            mapa_hibrido = (mapa_hibrido - min_val) / (max_val - min_val)
+    
+    # Imponer la condición geométrica: el anillo interior de borde es altura 0.
+    if np.any(dentro):
+        borde_interior = distancia <= (min_dist + 1e-6)
+        mapa_hibrido[borde_interior] = 0.0
+
+    # Aplicar máscara final
+    mapa_altura = mapa_hibrido * mascara_bin
     
     return mapa_altura
 
@@ -234,13 +314,11 @@ def mapear_relieve_a_landmarks(mapa_altura, landmarks_2d, altura_max=ALTURA_RELI
     # Nota: RectBivariateSpline espera (y, x) en ese orden
     valores_z = interp_func.ev(landmarks_imagen[:, 1], landmarks_imagen[:, 0])
     
-    # Re-normalizar para usar el rango completo disponible [0, 1]
-    # Esto corrige el bug donde el mapa de altura no usa el rango completo
-    z_min, z_max = valores_z.min(), valores_z.max()
-    if z_max - z_min > 1e-6:
-        valores_z = (valores_z - z_min) / (z_max - z_min)
-    else:
-        valores_z = np.zeros_like(valores_z)
+    # El mapa ya est� normalizado dentro de la silueta. No se debe
+    # renormalizar usando �nicamente los landmarks: son puntos del contorno
+    # y, por dise�o, pueden tener un rango de alturas peque�o. Forzar ese
+    # rango a [0, 1] inventar�a una amplitud de relieve de 0..altura_max.
+    valores_z = np.clip(valores_z, 0.0, 1.0)
     
     # PASO 3: Escalar por altura_max
     valores_z_escalados = valores_z * altura_max
@@ -260,7 +338,7 @@ def mapear_relieve_a_landmarks(mapa_altura, landmarks_2d, altura_max=ALTURA_RELI
 # ==============================================================
 
 def guardar_relieve_json(mapa_altura, landmarks_3d, ruta_salida, altura_max=ALTURA_RELIEVE_DEFAULT, 
-                         metodo=METODO_DEFAULT):
+                         metodo=METODO_DEFAULT, mascara=None):
     """
     Guarda datos de relieve en formato JSON.
     
@@ -277,6 +355,7 @@ def guardar_relieve_json(mapa_altura, landmarks_3d, ruta_salida, altura_max=ALTU
         "altura_max": altura_max,
         "metodo": metodo,
         "mapa_altura": mapa_altura.tolist(),  # Array 2D como lista de listas
+        "mascara": (mascara > 0).astype(np.uint8).tolist() if mascara is not None else None,
         "landmarks_relieve": landmarks_3d.tolist(),  # Landmarks 3D
         "metadatos": {
             "metodo": metodo,
@@ -323,7 +402,8 @@ def cargar_relieve_json(ruta_entrada):
 # ==============================================================
 
 def procesar_imagen_con_relieve(ruta_imagen, ruta_silueta, ruta_salida, 
-                                metodo=METODO_DEFAULT, altura_max=ALTURA_RELIEVE_DEFAULT):
+                                metodo=METODO_DEFAULT, altura_max=ALTURA_RELIEVE_DEFAULT, 
+                                peso_base=PESO_BASE_DEFAULT, sigma_filtro=SIGMA_FILTRO_DEFAULT):
     """
     Procesa una imagen para estimar su relieve y mapearlo a landmarks existentes.
     
@@ -352,7 +432,9 @@ def procesar_imagen_con_relieve(ruta_imagen, ruta_silueta, ruta_salida,
     _, mascara = cv2.threshold(imagen, 200, 255, cv2.THRESH_BINARY_INV)
     
     # Estimar mapa de altura
-    mapa_altura = estimar_relieve_sfs(imagen, mascara, metodo=metodo)
+    mapa_altura = estimar_relieve_sfs(
+        imagen, mascara, metodo=metodo, peso_base=peso_base, sigma_filtro=sigma_filtro
+    )
     
     # Cargar landmarks 2D existentes
     from modelo_forma_especie import extraer_puntos
@@ -362,7 +444,10 @@ def procesar_imagen_con_relieve(ruta_imagen, ruta_silueta, ruta_salida,
     landmarks_3d = mapear_relieve_a_landmarks(mapa_altura, landmarks_2d, altura_max=altura_max)
     
     # Guardar resultados
-    guardar_relieve_json(mapa_altura, landmarks_3d, ruta_salida, altura_max=altura_max, metodo=metodo)
+    guardar_relieve_json(
+        mapa_altura, landmarks_3d, ruta_salida, altura_max=altura_max,
+        metodo=metodo, mascara=mascara
+    )
     
     return {
         "mapa_altura": mapa_altura,

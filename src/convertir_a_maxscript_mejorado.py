@@ -19,6 +19,40 @@ import json
 import math
 import sys
 import argparse
+
+
+def malla_desde_mapa_relieve(datos, resolucion_max=80):
+    """Convierte el mapa de altura y su m�scara en una malla regular decimada."""
+    mapa = datos.get("mapa_altura")
+    mascara = datos.get("mascara")
+    if not mapa or not mascara:
+        raise ValueError("El JSON de relieve no contiene mapa_altura y mascara.")
+
+    alto, ancho = len(mapa), len(mapa[0])
+    paso = max(1, math.ceil(max(alto, ancho) / resolucion_max))
+    altura_max = float(datos.get("altura_max", 20.0))
+    vertices, indices = [], {}
+
+    for y in range(0, alto, paso):
+        for x in range(0, ancho, paso):
+            if mascara[y][x]:
+                indices[(y, x)] = len(vertices) + 1  # MAXScript indexa desde 1
+                vertices.append([
+                    x - ancho / 2.0,
+                    alto / 2.0 - y,
+                    float(mapa[y][x]) * altura_max,
+                ])
+
+    caras = []
+    for y in range(0, alto - paso, paso):
+        for x in range(0, ancho - paso, paso):
+            claves = [(y, x), (y, x + paso), (y + paso, x + paso), (y + paso, x)]
+            if all(clave in indices for clave in claves):
+                caras.append([indices[clave] for clave in claves])
+
+    if len(vertices) < 3 or not caras:
+        raise ValueError("La m�scara de relieve no produjo una malla utilizable.")
+    return vertices, caras
 from pathlib import Path
 
 
@@ -28,6 +62,15 @@ def extraer_puntos_mejorado(ruta_archivo):
         with open(ruta_archivo, encoding="utf-8") as f:
             data = json.load(f)
         
+        # Mapa de relieve h�brido: convertirlo a malla antes de exportar.
+        if data.get("tipo") == "mapa_relieve_sfs":
+            vertices, caras = malla_desde_mapa_relieve(data)
+            return {
+                "tipo": "malla_3d",
+                "vertices": vertices,
+                "caras": caras,
+                "altura_relieve": data.get("altura_max", 20.0),
+            }
         # Si es una malla 3D generada por el extractor
         if data.get("tipo") == "reconstruccion_3d_relativa":
             return {
@@ -142,6 +185,7 @@ def generar_maxscript_mejorado(
         lineas.append("-- Crear malla desde vertices y caras")
         lineas.append("m = mesh vertices:vertices faces:caras")
         lineas.append(f"m.name = \"{nombre_objeto}\"")
+        lineas.append("objeto_final = m")
         lineas.append("")
         
         if detalle_superficie:
@@ -161,6 +205,7 @@ def generar_maxscript_mejorado(
         
         lineas.append("-- Creando silueta base desde coordenadas 2D")
         lineas.append("shp = splineShape pos:[0,0,0] name:\"{}\"".format(nombre_objeto))
+        lineas.append("objeto_final = shp")
         lineas.append("addNewSpline shp")
         lineas.append("")
         
@@ -222,7 +267,7 @@ def generar_maxscript_mejorado(
     lineas.append("-- Configuración final")
     lineas.append("max zoomext sel all")
     lineas.append("")
-    lineas.append('print ("Hoja 3D realista creada: " + shp.name)')
+    lineas.append('print ("Hoja 3D realista creada: " + objeto_final.name)')
     
     return "\n".join(lineas)
 
